@@ -91,7 +91,8 @@ export default function Home() {
       context.fillStyle = '#22c55e';
 
       faces.forEach((face) => {
-        const x = face.box.x * canvas.width;
+        const mirroredX = 1 - face.box.x - face.box.width;
+        const x = mirroredX * canvas.width;
         const y = face.box.y * canvas.height;
         const width = face.box.width * canvas.width;
         const height = face.box.height * canvas.height;
@@ -257,6 +258,7 @@ export default function Home() {
           <video
             ref={videoRef}
             className="absolute inset-0 h-full w-full object-cover"
+            style={{ transform: 'scaleX(-1)' }}
             playsInline
             muted
             autoPlay
