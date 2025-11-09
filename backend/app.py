@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+import os
+from pathlib import Path
 from typing import Any, Dict
 
 from flask import Flask, jsonify, request
@@ -22,7 +24,13 @@ socketio = SocketIO(
     max_http_buffer_size=6 * 1024 * 1024,
 )
 
-pipeline = InferencePipeline()
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_EMOTION_WEIGHTS = BASE_DIR / "artifacts" / "emotion-net.pt"
+EMOTION_WEIGHTS_PATH = Path(
+    os.environ.get("SENTIVIS_EMOTION_WEIGHTS") or DEFAULT_EMOTION_WEIGHTS
+)
+
+pipeline = InferencePipeline(emotion_weights_path=str(EMOTION_WEIGHTS_PATH))
 
 
 @app.get("/healthz")

@@ -5,8 +5,8 @@ import Script from 'next/script';
 
 type SocketClient = {
   emit: (event: string, payload?: unknown) => void;
-  on: (event: string, callback: (...args: any[]) => void) => void;
-  off: (event: string, callback?: (...args: any[]) => void) => void;
+  on: (event: string, callback: (...args: unknown[]) => void) => void;
+  off: (event: string, callback?: (...args: unknown[]) => void) => void;
   disconnect: () => void;
   connected: boolean;
 };
@@ -19,19 +19,29 @@ type FaceBox = {
   score: number;
 };
 
-type EmotionSummary = {
+type EmotionScore = {
   label: string;
   confidence: number;
-  scores: number[];
 };
 
-type FaceInference = {
+type EmotionPrediction = {
+  label: string;
+  confidence: number;
+  scores?: EmotionScore[];
+};
+
+type BackendModels = {
+  emotion?: 'ready' | 'unavailable';
+};
+
+type FaceDetection = {
   box: FaceBox;
-  emotion: EmotionSummary;
+  emotion?: EmotionPrediction;
 };
 
 type InferencePayload = {
-  faces: FaceInference[];
+  faces: FaceDetection[];
+  models?: BackendModels;
   metrics?: {
     latencyMs?: number;
   };
@@ -49,6 +59,9 @@ const STREAM_INTERVAL_MS = 150;
 const SOCKET_URL =
   process.env.NEXT_PUBLIC_SENTIVIS_SOCKET_URL ?? 'http://localhost:5001';
 
+const formatEmotionLabel = (value?: string | null) =>
+  value ? value.charAt(0).toUpperCase() + value.slice(1) : null;
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -58,24 +71,35 @@ export default function Home() {
 
   const [scriptLoaded, setScriptLoaded] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'ready' | 'error'>('idle');
-  const [latestFaces, setLatestFaces] = useState<FaceInference[]>([]);
+  const [latestFaces, setLatestFaces] = useState<FaceDetection[]>([]);
   const [latency, setLatency] = useState<number | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [modelsStatus, setModelsStatus] = useState<BackendModels>({});
 
-  const displayEmotion = useMemo(() => {
+  const detectionSummary = useMemo(() => {
     if (!latestFaces.length) {
-      return { label: 'No face detected', confidence: 0 };
+      return {
+        label: 'No face detected',
+        score: null as number | null,
+        emotionLabel: null as string | null,
+        emotionScore: null as number | null,
+      };
     }
 
-    const { label, confidence } = latestFaces[0].emotion;
+    const primaryFace = latestFaces[0];
+    const score = primaryFace.box.score;
+    const emotion = primaryFace.emotion;
+
     return {
-      label: label.toUpperCase(),
-      confidence: Math.round(confidence * 100),
+      label: 'Face detected',
+      score: score != null ? Math.round(score * 100) : null,
+      emotionLabel: emotion?.label ?? null,
+      emotionScore: emotion?.confidence != null ? Math.round(emotion.confidence * 100) : null,
     };
   }, [latestFaces]);
 
   const drawOverlay = useCallback(
-    (faces: FaceInference[]) => {
+    (faces: FaceDetection[]) => {
       const canvas = overlayCanvasRef.current;
       const video = videoRef.current;
       if (!canvas || !video) return;
@@ -99,7 +123,19 @@ export default function Home() {
 
         context.strokeRect(x, y, width, height);
 
-        const label = `${face.emotion.label} ${(face.emotion.confidence * 100).toFixed(0)}%`;
+        const scorePercent =
+          typeof face.box.score === 'number'
+            ? (face.box.score * 100).toFixed(0)
+            : '—';
+        const emotionLabel = formatEmotionLabel(face.emotion?.label);
+        const emotionConfidence =
+          face.emotion?.confidence != null
+            ? (face.emotion.confidence * 100).toFixed(0)
+            : null;
+        const label =
+          emotionLabel && emotionConfidence
+            ? `${emotionLabel} ${emotionConfidence}%`
+            : `Face ${scorePercent}%`;
         const labelWidth = context.measureText(label).width + 12;
         const labelX = Math.max(0, Math.min(canvas.width - labelWidth, x));
         const labelY = y - 28 < 0 ? y + height + 4 : y - 28;
@@ -128,6 +164,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    let capturedVideo: HTMLVideoElement | null = null;
+
     const openCamera = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -136,6 +174,7 @@ export default function Home() {
 
         const video = videoRef.current;
         if (video) {
+          capturedVideo = video;
           video.srcObject = stream;
           await video.play();
 
@@ -154,8 +193,7 @@ export default function Home() {
     openCamera();
 
     return () => {
-      const video = videoRef.current;
-      const stream = video?.srcObject as MediaStream | null;
+      const stream = capturedVideo?.srcObject as MediaStream | null;
       stream?.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -176,6 +214,7 @@ export default function Home() {
 
     const handleInference = (payload: InferencePayload) => {
       setLatestFaces(payload.faces ?? []);
+      setModelsStatus(payload.models ?? {});
       if (payload.metrics?.latencyMs !== undefined) {
         setLatency(Math.round(payload.metrics.latencyMs));
       }
@@ -250,7 +289,7 @@ export default function Home() {
         <header className="flex flex-col gap-2">
           <h1 className="text-3xl font-semibold">Sentivis</h1>
           <p className="text-sm text-slate-400">
-            Real-time facial sentiment analysis. Position your face inside the frame to see live predictions.
+            Real-time emotion analysis. Position your face inside the frame to see live detections and mood estimates.
           </p>
         </header>
 
@@ -270,7 +309,7 @@ export default function Home() {
           {connectionStatus !== 'ready' && (
             <div className="absolute bottom-4 left-4 rounded-lg bg-slate-900/80 px-4 py-2 text-sm text-slate-300">
               {connectionStatus === 'connecting'
-                ? 'Connecting to sentiment engine...'
+                ? 'Connecting to face engine...'
                 : connectionStatus === 'error'
                   ? 'Disconnected from backend'
                   : 'Initializing...'}
@@ -278,17 +317,28 @@ export default function Home() {
           )}
         </section>
 
-        <section className="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4 md:grid-cols-3">
+        <section className="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/40 p-4 md:grid-cols-4">
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-4">
-            <h2 className="text-xs uppercase text-slate-500">Current Emotion</h2>
+            <h2 className="text-xs uppercase text-slate-500">Face Detection</h2>
             <p className="mt-3 text-2xl font-medium text-slate-100">
-              {displayEmotion.label}
+              {detectionSummary.label}
             </p>
-            {displayEmotion.confidence > 0 && (
+            {detectionSummary.score !== null && (
               <p className="text-sm text-slate-400">
-                Confidence: {displayEmotion.confidence}%
+                Confidence: {detectionSummary.score}%
               </p>
             )}
+            <p className="text-sm text-slate-400">
+              Faces tracked: {latestFaces.length}
+            </p>
+            <p className="text-sm text-slate-400">
+              Primary emotion:{' '}
+              {detectionSummary.emotionLabel
+                ? `${formatEmotionLabel(detectionSummary.emotionLabel)}${
+                    detectionSummary.emotionScore !== null ? ` (${detectionSummary.emotionScore}%)` : ''
+                  }`
+                : '—'}
+            </p>
           </div>
 
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-4">
@@ -297,6 +347,18 @@ export default function Home() {
               {latency !== null ? `${latency} ms` : '—'}
             </p>
             <p className="text-sm text-slate-400">Round-trip inference time</p>
+          </div>
+
+          <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-4">
+            <h2 className="text-xs uppercase text-slate-500">Emotion Model</h2>
+            <p className="mt-3 text-2xl font-medium text-slate-100">
+              {modelsStatus.emotion === 'ready' ? 'Ready' : 'Not loaded'}
+            </p>
+            <p className="text-sm text-slate-400">
+              {modelsStatus.emotion === 'ready'
+                ? 'FER-2013 weights loaded'
+                : 'Train the backend model to enable predictions'}
+            </p>
           </div>
 
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 p-4">

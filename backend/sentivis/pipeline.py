@@ -4,13 +4,13 @@ import base64
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
-from .emotion_model import EmotionClassifier, EmotionPrediction
+from .emotion_model import EmotionClassifier
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,19 +24,15 @@ class BoundingBox:
     score: float
 
 
-@dataclass
-class FaceAnalysis:
-    box: BoundingBox
-    emotion: EmotionPrediction
-
-
 class InferencePipeline:
-    def __init__(self, min_detection_confidence: float = 0.6) -> None:
-        self._detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=min_detection_confidence,
-        )
-        self._classifier = EmotionClassifier()
+    def __init__(
+        self,
+        min_detection_confidence: float = 0.6,
+        emotion_weights_path: Optional[str] = None,
+    ) -> None:
+        self._min_detection_confidence = min_detection_confidence
+        self._detector = self._create_detector()
+        self._emotion_classifier = EmotionClassifier(weights_path=emotion_weights_path)
 
     def reset(self) -> None:
         """
@@ -48,10 +44,7 @@ class InferencePipeline:
         except AttributeError:
             pass
 
-        self._detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.6,
-        )
+        self._detector = self._create_detector()
 
     def process_frame(self, frame_payload: str) -> Dict[str, Any]:
         if not frame_payload:
@@ -61,35 +54,49 @@ class InferencePipeline:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._detector.process(frame_rgb)
 
-        analysis: Optional[FaceAnalysis] = None
+        faces: List[Dict[str, Any]] = []
         if results.detections:
-            detection = results.detections[0]
-            analysis = self._analyze_detection(detection, frame)
+            for detection in results.detections:
+                bbox_and_crop = self._extract_bounding_box(detection, frame)
+                if bbox_and_crop is None:
+                    continue
+
+                detection_box, face_crop = bbox_and_crop
+                face_payload: Dict[str, Any] = {
+                    "box": {
+                        "x": detection_box.x,
+                        "y": detection_box.y,
+                        "width": detection_box.width,
+                        "height": detection_box.height,
+                        "score": detection_box.score,
+                    },
+                }
+
+                emotion_payload = self._run_emotion_classifier(face_crop)
+                if emotion_payload is not None:
+                    face_payload["emotion"] = emotion_payload
+
+                faces.append(face_payload)
 
         response: Dict[str, Any] = {
             "timestamp": time.time(),
-            "faces": [],
+            "faces": faces,
+            "models": {
+                "emotion": (
+                    "ready"
+                    if self._emotion_classifier.is_ready
+                    else "unavailable"
+                ),
+            },
         }
 
-        if analysis is not None:
-            response["faces"].append(
-                {
-                    "box": {
-                        "x": analysis.box.x,
-                        "y": analysis.box.y,
-                        "width": analysis.box.width,
-                        "height": analysis.box.height,
-                        "score": analysis.box.score,
-                    },
-                    "emotion": {
-                        "label": analysis.emotion.label,
-                        "confidence": analysis.emotion.confidence,
-                        "scores": analysis.emotion.scores,
-                    },
-                }
-            )
-
         return response
+
+    def _create_detector(self) -> mp.solutions.face_detection.FaceDetection:
+        return mp.solutions.face_detection.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=self._min_detection_confidence,
+        )
 
     @staticmethod
     def _decode_frame(frame_payload: str) -> np.ndarray:
@@ -109,7 +116,11 @@ class InferencePipeline:
 
         return frame
 
-    def _analyze_detection(self, detection: Any, frame: np.ndarray) -> Optional[FaceAnalysis]:
+    def _extract_bounding_box(
+        self,
+        detection: Any,
+        frame: np.ndarray,
+    ) -> Optional[Tuple[BoundingBox, np.ndarray]]:
         image_height, image_width, _ = frame.shape
 
         try:
@@ -140,21 +151,36 @@ class InferencePipeline:
             LOGGER.debug("Empty crop for bounding box: %s", bbox)
             return None
 
-        try:
-            prediction = self._classifier.predict(crop)
-        except ValueError as exc:
-            LOGGER.warning("Failed to run emotion classifier: %s", exc)
-            return None
-
         detection_score = float(detection.score[0]) if detection.score else 0.0
 
-        return FaceAnalysis(
-            box=BoundingBox(
+        return (
+            BoundingBox(
                 x=xmin,
                 y=ymin,
                 width=width,
                 height=height,
                 score=detection_score,
             ),
-            emotion=prediction,
+            crop,
         )
+
+    def _run_emotion_classifier(self, face_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+        if not self._emotion_classifier.is_ready:
+            return None
+
+        try:
+            prediction = self._emotion_classifier.predict(face_bgr)
+        except (ValueError, RuntimeError) as exc:
+            LOGGER.debug("Skipping emotion classification: %s", exc)
+            return None
+
+        scores_payload = [
+            {"label": label, "confidence": score}
+            for label, score in zip(self._emotion_classifier.labels, prediction.scores)
+        ]
+
+        return {
+            "label": prediction.label,
+            "confidence": prediction.confidence,
+            "scores": scores_payload,
+        }
